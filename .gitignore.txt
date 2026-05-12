@@ -1,0 +1,10 @@
+# Ignore datasets
+data/
+*.csv
+
+# Ignore ML Models
+artifacts/
+*.pkl
+
+# Ignore Python cache
+__pycache__/
