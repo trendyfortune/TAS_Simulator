@@ -6,45 +6,29 @@ import numpy as np
 import os
 
 def round_robin_scheduler(unplaced_vms, datacenter, start_index=0):
-    """
-    BASELINE 1: Spreads VMs equally across all hosts in a circle.
-    Thermal Agnostic. Energy Inefficient (keeps too many hosts awake).
-    """
     placed_count = 0
     host_count = len(datacenter)
     host_index = start_index
 
     for vm in unplaced_vms:
         loop_start = host_index
-        
         while True:
             target_host = datacenter[host_index]
-            
             if target_host.can_accept(vm):
                 target_host.add_vm(vm)
                 target_host.is_active = True  
                 placed_count += 1
-                
                 host_index = (host_index + 1) % host_count
                 break
-            
             host_index = (host_index + 1) % host_count
-            
             if host_index == loop_start:
-                print(f"WARNING: Datacenter FULL. Could not place {vm.vm_id}")
                 break
-                
     return placed_count, host_index
 
 
 def greedy_consolidation_scheduler(unplaced_vms, datacenter):
-    """
-    BASELINE 2: Packs VMs onto the fewest number of hosts possible.
-    Thermal Agnostic. Energy Efficient, but creates massive Hotspots.
-    """
     unplaced_vms.sort(key=lambda v: v.used_cores, reverse=True)
     placed_count = 0
-
     for vm in unplaced_vms:
         for target_host in datacenter:
             if target_host.can_accept(vm):
@@ -52,12 +36,10 @@ def greedy_consolidation_scheduler(unplaced_vms, datacenter):
                 target_host.is_active = True 
                 placed_count += 1
                 break
-                
     return placed_count
 
 
 class ThermalPredictor:
-    """Loads your Kaggle-tier Stacking Ensemble and applies physical calibrations."""
     def __init__(self, artifacts_dir="artifacts"):
         print("Loading ML Models from artifacts folder...")
         self.rf = joblib.load(os.path.join(artifacts_dir, "rf_final.pkl"))
@@ -70,7 +52,6 @@ class ThermalPredictor:
         print("ML Models loaded successfully!")
 
     def predict(self, host, projected_cpu_util, projected_power, telemetry_row):
-        """Calculates the hypothetical physics if we place a VM on this host."""
         data = telemetry_row.copy()
         prev_power = data.get("Power", 0.0)
         prev_cpu_load = data.get("CPU_Load", 0.0)
@@ -83,9 +64,16 @@ class ThermalPredictor:
         data["CPU_cores_used"] = projected_cpu_util * host.max_cores
         data["Core_util"] = projected_cpu_util
         
-        future_vm_count = len(host.hosted_vms) + 1
-        data["VM_per_core"] = future_vm_count / (host.max_cores + 1e-6)
-        data["Power_per_VM"] = projected_power / future_vm_count
+        # Float-point accuracy fix: ensures logging exactly matches reality
+        is_hypothetical = projected_cpu_util > (host.current_cpu_utilization + 1e-6)
+        
+        if is_hypothetical:
+            vm_count = len(host.hosted_vms) + 1
+        else:
+            vm_count = max(1, len(host.hosted_vms))
+            
+        data["VM_per_core"] = vm_count / (host.max_cores + 1e-6)
+        data["Power_per_VM"] = projected_power / vm_count
         
         safe_cpu = max(projected_cpu_load, 10.0)
         data["Power_per_CPU"] = projected_power / safe_cpu
@@ -103,7 +91,6 @@ class ThermalPredictor:
                 
         X = df[self.features]
         
-        # Base Predictions
         rf_pred = self.rf.predict(X)
         xgb_pred = self.xgb.predict(X)
         X_scaled = self.en_scaler.transform(X)
@@ -113,30 +100,15 @@ class ThermalPredictor:
         meta_X_scaled = self.meta_scaler.transform(meta_X)
         base_temp = self.meta_model.predict(meta_X_scaled)[0]
         
-       # ==========================================
-        # PHYSICAL CALIBRATION (The Density Extrapolator)
-        # ==========================================
-        # Because the CSV dataset contains mostly light-workload VMs, the real physical 
-        # CPU utilization stays low even when a server is 100% full of allocated cores.
-        # However, packing too many VMs on a single server causes I/O and Network hotspots.
-        # We penalize 'Zombie VM Packing' by triggering a meltdown prediction if 
-        # the server has more than 8 VMs packed onto it.
-        
         thermal_penalty = 0.0
-        if future_vm_count > 8:
-            # Add an exponential +12°C for every VM jammed onto the server beyond 8
-            thermal_penalty = (future_vm_count - 8) * 12.0 
+        if vm_count > 8:
+            thermal_penalty = (vm_count - 8) * 12.0 
             
         final_temp = base_temp + thermal_penalty
         return final_temp
 
 
 def tas_scheduler(unplaced_vms, datacenter, telemetry_data, predictor):
-    """
-    BASELINE 3: Thermal-Aware Scheduler (Your Algorithm).
-    Places VMs on the host that will result in the lowest exhaust temperature.
-    Consolidates power gracefully without melting servers.
-    """
     placed_count = 0
     unplaced_vms.sort(key=lambda v: v.cores, reverse=True)
     
@@ -147,14 +119,15 @@ def tas_scheduler(unplaced_vms, datacenter, telemetry_data, predictor):
         active_hosts = [h for h in datacenter if h.is_active and h.can_accept(vm)]
         
         for host in active_hosts:
-            projected_cpu = host.current_cpu_utilization + (vm.cores / host.max_cores)
+            projected_cpu = host.current_cpu_utilization + (vm.used_cores / host.max_cores)
             projected_power = host.idle_power + (projected_cpu * (host.max_power - host.idle_power))
             
             t_data = telemetry_data.get(host.host_id, {})
             predicted_temp = predictor.predict(host, projected_cpu, projected_power, t_data)
             
-            # Thermal Redline from the IEEE paper is 105°C
-            if predicted_temp < 105.0 and predicted_temp < lowest_temp:
+            # THE FIX: We use a 90°C placement threshold to leave a 15°C Safety Buffer!
+            # This allows the servers to survive ambient weather changes in the afternoon.
+            if predicted_temp < 90.0 and predicted_temp < lowest_temp:
                 lowest_temp = predicted_temp
                 best_host = host
                 
@@ -169,25 +142,3 @@ def tas_scheduler(unplaced_vms, datacenter, telemetry_data, predictor):
             placed_count += 1
             
     return placed_count
-
-
-# ==========================================
-# QUICK TEST
-# ==========================================
-if __name__ == "__main__":
-    from datacenter import Host, VM
-
-    print("--- Testing TAS ML Scheduler ---")
-    dc_tas = [Host(f"Host_{i}") for i in range(3)]
-    dc_tas[0].is_active = True 
-    
-    vms_tas = [VM(f"VM_{i}", "VM4") for i in range(6)]
-    for v in vms_tas: v.cpu_utilization = 0.25 
-    
-    dummy_telemetry = {"Host_0": {"Fan_speed1": 9000, "Network_RX": 1000}}
-    ml_brain = ThermalPredictor("artifacts")
-    
-    tas_scheduler(vms_tas, dc_tas, dummy_telemetry, ml_brain)
-    
-    for h in dc_tas:
-        print(h)

@@ -1,10 +1,21 @@
-# Ignore datasets
+# Ignore Physical Datasets
 data/
+
+# Ignore Virtual Datasets (Bitbrains)
+bitbrains_data/
+
+# Ignore all stray CSVs
 *.csv
 
 # Ignore ML Models
 artifacts/
 *.pkl
 
+# Ignore Simulation Outputs
+results/
+graphs/
+*.png
+
 # Ignore Python cache
 __pycache__/
+*.pyc
