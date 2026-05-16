@@ -7,7 +7,7 @@ class VM:
         self.vm_id = vm_id
         self.flavor = flavor
         
-        # Match Table 4 from the paper [cite: 398]
+        # Match Table 4 from the paper
         if flavor == "VM1":
             self.cores, self.ram = 1, 4
         elif flavor == "VM2":
@@ -64,12 +64,18 @@ class Host:
         return self.idle_power + (self.current_cpu_utilization * (self.max_power - self.idle_power))
 
     def can_accept(self, vm):
-        projected_cores = sum(v.cores for v in self.hosted_vms) + vm.cores
+        # THE FIX: Limit by ACTUAL CPU Utilization (used_cores), not Provisioned capacity
+        projected_used_cores = sum(v.used_cores for v in self.hosted_vms) + vm.used_cores
         projected_ram = sum(v.ram for v in self.hosted_vms) + vm.ram
-        if (projected_cores / self.max_cores) > 0.90:
+        
+        # Max 90% Utilization Cap (Matching the IEEE paper exactly)
+        if (projected_used_cores / self.max_cores) > 0.90:
             return False
+            
+        # RAM is a hard physical limit, so we keep provisioned RAM
         if (projected_ram / self.max_ram) > 1.0:
             return False
+            
         return True
 
     def add_vm(self, vm):
@@ -109,7 +115,7 @@ class WorkloadStreamer:
             # Convert percentage to decimal, fallback to 10% if missing
             cpu_util = float(row.get("CPU_Load", 10.0)) / 100.0 
             
-            # Create a standard 4-Core VM (VM3) [cite: 398]
+            # Create a standard 4-Core VM (VM3)
             vm = VM(vm_id=f"vm_{self.current_step}", flavor="VM3")
             vm.cpu_utilization = cpu_util
             vms.append(vm)

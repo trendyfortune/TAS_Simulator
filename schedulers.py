@@ -1,5 +1,3 @@
-# schedulers.py
-
 import joblib
 import pandas as pd
 import numpy as np
@@ -7,37 +5,54 @@ import os
 
 def round_robin_scheduler(unplaced_vms, datacenter, start_index=0):
     placed_count = 0
-    host_count = len(datacenter)
-    host_index = start_index
-
+    
     for vm in unplaced_vms:
-        loop_start = host_index
-        while True:
-            target_host = datacenter[host_index]
-            if target_host.can_accept(vm):
-                target_host.add_vm(vm)
-                target_host.is_active = True  
-                placed_count += 1
-                host_index = (host_index + 1) % host_count
-                break
-            host_index = (host_index + 1) % host_count
-            if host_index == loop_start:
-                break
-    return placed_count, host_index
-
+        placed = False
+        
+        # CONSTRAINT 3: Try active hosts first in a round-robin fashion
+        active_hosts = [h for h in datacenter if h.is_active]
+        if active_hosts:
+            for i in range(len(active_hosts)):
+                idx = (start_index + i) % len(active_hosts)
+                target_host = active_hosts[idx]
+                projected_cpu = target_host.current_cpu_utilization + (vm.used_cores / target_host.max_cores)
+                
+                # CONSTRAINT 1: Max 0.9 CPU Utilization
+                if target_host.can_accept(vm) and projected_cpu <= 0.9:
+                    target_host.add_vm(vm)
+                    placed_count += 1
+                    placed = True
+                    start_index = (idx + 1) % len(active_hosts)
+                    break
+        
+        # If active hosts are full (hit 0.9 limit), wake up one inactive host
+        if not placed:
+            inactive_hosts = [h for h in datacenter if not h.is_active]
+            for target_host in inactive_hosts:
+                projected_cpu = target_host.current_cpu_utilization + (vm.used_cores / target_host.max_cores)
+                if target_host.can_accept(vm) and projected_cpu <= 0.9:
+                    target_host.is_active = True
+                    target_host.add_vm(vm)
+                    placed_count += 1
+                    placed = True
+                    break
+                    
+    return placed_count, start_index
 
 def greedy_consolidation_scheduler(unplaced_vms, datacenter):
     unplaced_vms.sort(key=lambda v: v.used_cores, reverse=True)
     placed_count = 0
     for vm in unplaced_vms:
         for target_host in datacenter:
-            if target_host.can_accept(vm):
+            projected_cpu = target_host.current_cpu_utilization + (vm.used_cores / target_host.max_cores)
+            
+            # CONSTRAINT 1: Max 0.9 CPU Utilization
+            if target_host.can_accept(vm) and projected_cpu <= 0.9:
                 target_host.add_vm(vm)
                 target_host.is_active = True 
                 placed_count += 1
                 break
     return placed_count
-
 
 class ThermalPredictor:
     def __init__(self, artifacts_dir="artifacts"):
@@ -64,7 +79,6 @@ class ThermalPredictor:
         data["CPU_cores_used"] = projected_cpu_util * host.max_cores
         data["Core_util"] = projected_cpu_util
         
-        # Float-point accuracy fix: ensures logging exactly matches reality
         is_hypothetical = projected_cpu_util > (host.current_cpu_utilization + 1e-6)
         
         if is_hypothetical:
@@ -98,15 +112,11 @@ class ThermalPredictor:
         
         meta_X = np.column_stack([rf_pred, xgb_pred, en_pred])
         meta_X_scaled = self.meta_scaler.transform(meta_X)
+        
+        # THE FIX: Trust your ML models! Return the pure predicted temperature.
         base_temp = self.meta_model.predict(meta_X_scaled)[0]
         
-        thermal_penalty = 0.0
-        if vm_count > 8:
-            thermal_penalty = (vm_count - 8) * 12.0 
-            
-        final_temp = base_temp + thermal_penalty
-        return final_temp
-
+        return base_temp
 
 def tas_scheduler(unplaced_vms, datacenter, telemetry_data, predictor):
     placed_count = 0
@@ -120,22 +130,29 @@ def tas_scheduler(unplaced_vms, datacenter, telemetry_data, predictor):
         
         for host in active_hosts:
             projected_cpu = host.current_cpu_utilization + (vm.used_cores / host.max_cores)
+            
+            # CONSTRAINT 1: Max 0.9 CPU Utilization
+            if projected_cpu > 0.9:
+                continue
+                
             projected_power = host.idle_power + (projected_cpu * (host.max_power - host.idle_power))
             
             t_data = telemetry_data.get(host.host_id, {})
             predicted_temp = predictor.predict(host, projected_cpu, projected_power, t_data)
             
-            # THE FIX: We use a 90°C placement threshold to leave a 15°C Safety Buffer!
-            # This allows the servers to survive ambient weather changes in the afternoon.
-            if predicted_temp < 90.0 and predicted_temp < lowest_temp:
+            # CONSTRAINT 2: Target 105.0°C limit matching the paper exactly!
+            if predicted_temp < 105.0 and predicted_temp < lowest_temp:
                 lowest_temp = predicted_temp
                 best_host = host
                 
         if best_host is None:
             inactive_hosts = [h for h in datacenter if not h.is_active and h.can_accept(vm)]
-            if inactive_hosts:
-                best_host = inactive_hosts[0]
-                best_host.is_active = True 
+            for host in inactive_hosts:
+                projected_cpu = host.current_cpu_utilization + (vm.used_cores / host.max_cores)
+                if projected_cpu <= 0.9:
+                    best_host = host
+                    best_host.is_active = True 
+                    break
         
         if best_host:
             best_host.add_vm(vm)
