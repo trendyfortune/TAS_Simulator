@@ -159,3 +159,57 @@ def tas_scheduler(unplaced_vms, datacenter, telemetry_data, predictor):
             placed_count += 1
             
     return placed_count
+
+def ce_tas_scheduler(unplaced_vms, datacenter, telemetry_data, predictor):
+    """
+    Variation of TAS that strictly penalizes servers with poor cooling efficiency.
+    If a server takes too much power just to run the fans, it is skipped.
+    """
+    placed_count = 0
+    unplaced_vms.sort(key=lambda v: v.cores, reverse=True)
+    
+    for vm in unplaced_vms:
+        best_host = None
+        lowest_temp = float('inf')
+        
+        active_hosts = [h for h in datacenter if h.is_active and h.can_accept(vm)]
+        
+        for host in active_hosts:
+            projected_cpu = host.current_cpu_utilization + (vm.used_cores / host.max_cores)
+            
+            # CONSTRAINT 1: Max 0.9 CPU Utilization
+            if projected_cpu > 0.9:
+                continue
+                
+            # --- NEW ALGORITHM LOGIC: COOLING EFFICIENCY PENALTY ---
+            t_data = telemetry_data.get(host.host_id, {})
+            # If cooling efficiency is below 0.15 (taking too much power to cool), skip this host!
+            cooling_efficiency = t_data.get("Cooling_efficiency", 1.0)
+            if cooling_efficiency < 0.15:
+                continue 
+            # -------------------------------------------------------
+
+            projected_power = host.idle_power + (projected_cpu * (host.max_power - host.idle_power))
+            
+            predicted_temp = predictor.predict(host, projected_cpu, projected_power, t_data)
+            
+            # CONSTRAINT 2: Target 105.0°C limit
+            if predicted_temp < 105.0 and predicted_temp < lowest_temp:
+                lowest_temp = predicted_temp
+                best_host = host
+                
+        # Fallback: Wake up a new host if all active ones are too hot or too inefficient
+        if best_host is None:
+            inactive_hosts = [h for h in datacenter if not h.is_active and h.can_accept(vm)]
+            for host in inactive_hosts:
+                projected_cpu = host.current_cpu_utilization + (vm.used_cores / host.max_cores)
+                if projected_cpu <= 0.9:
+                    best_host = host
+                    best_host.is_active = True 
+                    break
+        
+        if best_host:
+            best_host.add_vm(vm)
+            placed_count += 1
+            
+    return placed_count

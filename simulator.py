@@ -4,8 +4,9 @@ import os
 import random
 import copy
 import pandas as pd
+
 from datacenter import Host, TelemetryProvider
-from schedulers import round_robin_scheduler, greedy_consolidation_scheduler, tas_scheduler, ThermalPredictor
+from schedulers import round_robin_scheduler, greedy_consolidation_scheduler, tas_scheduler, ThermalPredictor, ce_tas_scheduler
 
 def load_bitbrains_vms(data_dir="bitbrains_data", num_vms=750):
     print(f"Loading {num_vms} Virtual Machines from the Bitbrains dataset...")
@@ -81,9 +82,12 @@ def run_simulation(scheduler_name, bitbrains_vms, data_dir="data", steps=144):
                 incoming_vms.append(pending_vms.pop(0))
         
         # 2. Place VMs
+        # 2. Place VMs
         if incoming_vms:
             if scheduler_name == "tas":
                 tas_scheduler(incoming_vms, datacenter, current_telemetry, predictor)
+            elif scheduler_name == "ce_tas":
+                ce_tas_scheduler(incoming_vms, datacenter, current_telemetry, predictor)
             elif scheduler_name == "round_robin":
                 _, rr_index = round_robin_scheduler(incoming_vms, datacenter, start_index=rr_index)
             elif scheduler_name == "greedy":
@@ -142,3 +146,4 @@ if __name__ == "__main__":
         run_simulation("round_robin", global_bitbrains_vms, steps=144)
         run_simulation("greedy", global_bitbrains_vms, steps=144)
         run_simulation("tas", global_bitbrains_vms, steps=144)
+        run_simulation("ce_tas", global_bitbrains_vms, steps=144)
