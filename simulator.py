@@ -1,12 +1,11 @@
-# simulator.py
-
 import os
 import random
 import copy
 import pandas as pd
+import time  
 
 from datacenter import Host, TelemetryProvider
-from schedulers import round_robin_scheduler, greedy_consolidation_scheduler, tas_scheduler, ThermalPredictor, ce_tas_scheduler
+from schedulers import round_robin_scheduler, greedy_consolidation_scheduler, tas_scheduler, ce_tas_scheduler, lotas_scheduler, ThermalPredictor
 
 def load_bitbrains_vms(data_dir="bitbrains_data", num_vms=750):
     print(f"Loading {num_vms} Virtual Machines from the Bitbrains dataset...")
@@ -50,7 +49,7 @@ def run_simulation(scheduler_name, bitbrains_vms, data_dir="data", steps=144):
     csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
     if not csv_files:
         print("ERROR: No CSV files found in 'data/' folder!")
-        return
+        return 0.0
 
     datacenter = []
     telemetry_streams = {}
@@ -68,30 +67,36 @@ def run_simulation(scheduler_name, bitbrains_vms, data_dir="data", steps=144):
     simulation_log = []
     rr_index = 0  
     
-    # We pass a DEEP COPY so each scheduler gets fresh lifespans!
+    total_scheduling_time = 0.0 
     pending_vms = copy.deepcopy(bitbrains_vms)
 
     for step in range(steps):
         current_telemetry = {h.host_id: telemetry_streams[h.host_id].get_background_state() for h in datacenter}
         
-        # 1. Incoming Traffic Arrives (Heavy enterprise bursts)
+        # 1. Incoming Traffic Arrives
         incoming_vms = []
         if pending_vms:
             batch_size = random.randint(5, 10)
             for _ in range(min(batch_size, len(pending_vms))):
                 incoming_vms.append(pending_vms.pop(0))
         
-        # 2. Place VMs
-        # 2. Place VMs
+        # 2. Place VMs (WITH TIMERS)
+        start_scheduling = time.perf_counter() 
+        
         if incoming_vms:
             if scheduler_name == "tas":
                 tas_scheduler(incoming_vms, datacenter, current_telemetry, predictor)
             elif scheduler_name == "ce_tas":
                 ce_tas_scheduler(incoming_vms, datacenter, current_telemetry, predictor)
+            elif scheduler_name == "lotas":
+                lotas_scheduler(incoming_vms, datacenter, current_telemetry, predictor)
             elif scheduler_name == "round_robin":
                 _, rr_index = round_robin_scheduler(incoming_vms, datacenter, start_index=rr_index)
             elif scheduler_name == "greedy":
                 greedy_consolidation_scheduler(incoming_vms, datacenter)
+
+        end_scheduling = time.perf_counter() 
+        total_scheduling_time += (end_scheduling - start_scheduling)
 
         # 3. Log State
         active_hosts = [h for h in datacenter if h.is_active]
@@ -114,7 +119,7 @@ def run_simulation(scheduler_name, bitbrains_vms, data_dir="data", steps=144):
         if step % 20 == 0:
             print(f"Step {step:3}/{steps} | Active Hosts: {len(active_hosts):2} | Total Power: {total_power:7.1f}W | Max Temp: {max_temp:5.1f}C")
 
-        # 4. VM Departures (Servers cool down and power off when empty!)
+        # 4. VM Departures
         for host in datacenter:
             if host.is_active:
                 vms_to_remove = []
@@ -127,7 +132,6 @@ def run_simulation(scheduler_name, bitbrains_vms, data_dir="data", steps=144):
                 for vm in vms_to_remove:
                     host.hosted_vms.remove(vm)
                 
-                # Turn off the empty server!
                 if not host.hosted_vms:
                     host.is_active = False
 
@@ -135,7 +139,14 @@ def run_simulation(scheduler_name, bitbrains_vms, data_dir="data", steps=144):
     os.makedirs("results", exist_ok=True)
     save_path = f"results/{scheduler_name}_log.csv"
     df_results.to_csv(save_path, index=False)
+    
     print(f"\nSimulation complete! Saved logs to {save_path}")
+    print(f"\n--- PERFORMANCE METRICS FOR {scheduler_name.upper()} ---")
+    print(f"Total Time Spent in Scheduler: {total_scheduling_time:.4f} seconds")
+    if scheduler_name in ["tas", "ce_tas", "lotas"]:
+        predictor.print_performance_stats()
+        
+    return total_scheduling_time # <--- WE RETURN THE TIME TO THE MAIN BLOCK
 
 if __name__ == "__main__":
     global_bitbrains_vms = load_bitbrains_vms("bitbrains_data", num_vms=750)
@@ -143,7 +154,55 @@ if __name__ == "__main__":
     if not global_bitbrains_vms:
         print("Aborting simulation. Please make sure the 750 Bitbrains CSV files are in the 'bitbrains_data' folder.")
     else:
-        run_simulation("round_robin", global_bitbrains_vms, steps=144)
-        run_simulation("greedy", global_bitbrains_vms, steps=144)
-        run_simulation("tas", global_bitbrains_vms, steps=144)
-        run_simulation("ce_tas", global_bitbrains_vms, steps=144)
+        # Capture the times returned by each simulation run
+        time_rr = run_simulation("round_robin", global_bitbrains_vms, steps=144)
+        time_greedy = run_simulation("greedy", global_bitbrains_vms, steps=144)
+        time_tas = run_simulation("tas", global_bitbrains_vms, steps=144)
+        time_lotas = run_simulation("lotas", global_bitbrains_vms, steps=144) 
+        time_ce_tas = run_simulation("ce_tas", global_bitbrains_vms, steps=144)
+        
+        # Link the times to the names
+        exec_times = {
+            'Round Robin': time_rr,
+            'Greedy': time_greedy,
+            'TAS (2021 Paper)': time_tas,
+            'LOTAS (2023 Paper)': time_lotas,
+            'CE-TAS (Novel)': time_ce_tas
+        }
+        
+        # --- GENERATE AND PRINT THE FINAL SUMMARY TABLE ---
+        print("\n" + "="*85)
+        print(" FINAL SIMULATION RESULTS SUMMARY".center(85))
+        print("="*85)
+        
+        files = {
+            'Round Robin': 'results/round_robin_log.csv',
+            'Greedy': 'results/greedy_log.csv',
+            'TAS (2021 Paper)': 'results/tas_log.csv',
+            'LOTAS (2023 Paper)': 'results/lotas_log.csv',
+            'CE-TAS (Novel)': 'results/ce_tas_log.csv'
+        }
+        
+        results = []
+        for name, filepath in files.items():
+            if os.path.exists(filepath):
+                df = pd.read_csv(filepath)
+                avg_hosts = df['Active_Hosts'].mean()
+                peak_temp = df['Max_Temperature_C'].max()
+                sched_time = exec_times.get(name, 0.0)
+                
+                results.append({
+                    'Algorithm': name,
+                    'Average Active Hosts': f"{avg_hosts:.2f}",
+                    'Peak Temp (°C)': f"{peak_temp:.2f}",
+                    'Scheduling Time (s)': f"{sched_time:.4f}"
+                })
+        
+        if results:
+            print(f"{'Algorithm':<22} | {'Average Active Hosts':<22} | {'Peak Temp (°C)':<15} | {'Scheduling Time (s)'}")
+            print("-" * 85)
+            for res in results:
+                print(f"{res['Algorithm']:<22} | {res['Average Active Hosts']:<22} | {res['Peak Temp (°C)']:<15} | {res['Scheduling Time (s)']}")
+        else:
+            print("Could not generate summary table. Log files not found.")
+        print("="*85 + "\n")
