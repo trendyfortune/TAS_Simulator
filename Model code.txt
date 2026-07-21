@@ -1,0 +1,325 @@
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.linear_model import Ridge, ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from xgboost import XGBRegressor
+import os
+import glob
+from sklearn.linear_model import RidgeCV
+# ==============================
+# FIXED HYPERPARAMETERS
+# ==============================
+
+RF_PARAMS = {
+    "n_estimators":      200,
+    "max_depth":         12,
+    "min_samples_split": 4,
+    "min_samples_leaf":  2,
+    "max_features":      "sqrt",
+    "random_state":      42,
+    "n_jobs":            -1
+}
+
+XGB_PARAMS = {
+    "n_estimators":     300,
+    "max_depth":        5,
+    "learning_rate":    0.05,
+    "subsample":        0.8,
+    "colsample_bytree": 0.8,
+    "reg_lambda":       1.0,
+    "random_state":     42,
+    "n_jobs":           -1,
+    "verbosity":        0
+}
+
+# ==============================
+# RESULT STORAGE
+# ==============================
+low_rmse_files = []
+
+results_rmse = {"rf": [], "svr": [], "knn": [], "xgb": [], "en": [], "stack": []}
+results_mae  = {"rf": [], "svr": [], "knn": [], "xgb": [], "en": [], "stack": []}
+results_r2   = {"rf": [], "svr": [], "knn": [], "xgb": [], "en": [], "stack": []}
+
+all_errors = {"rf": [], "svr": [], "knn": [], "xgb": [], "en": [], "stack": []}
+
+all_preds = {
+    "rf": [], "svr": [], "knn": [], "xgb": [], "en": [], "stack": [], "y_true": []
+}
+
+# ── Accumulators for the final meta-model ──────────────────────────────────
+# We collect OOF predictions from every file's TRAINING split only.
+# The final Ridge is then fit purely on these — no test data ever touches it.
+global_oof_preds  = {"rf": [], "svr": [], "knn": [], "xgb": [], "en": []}
+global_oof_labels = []
+# ──────────────────────────────────────────────────────────────────────────
+
+data_dir  = "Final Year Project/Cloud_data_filtered_without_nan"
+csv_files = glob.glob(os.path.join(data_dir, "*.csv"))
+
+print(f"Found {len(csv_files)} files")
+print(csv_files[:3])
+# ==============================
+# FEATURE ENGINEERING
+# ==============================
+
+def create_features(df):
+    df    = df.sort_values("Time").reset_index(drop=True)
+    df_fe = df.copy()
+
+    # ===== BASIC =====
+    df_fe["CPU_util"]    = df_fe["CPU_Load"] / 100
+    df_fe["Core_util"]   = df_fe["CPU_cores_used"] / (df_fe["CPU_cores"] + 1e-6)
+    df_fe["RAM_util"]    = df_fe["Ram_Used"] / (df_fe["Ram"] + 1e-6)
+    df_fe["VM_per_core"] = df_fe["No_Of_Running_vms"] / (df_fe["CPU_cores"] + 1e-6)
+
+    # ===== COOLING =====
+    fan_cols = [c for c in df_fe.columns if "Fan_speed" in c]
+    if fan_cols:
+        df_fe["Fan_mean"] = df_fe[fan_cols].mean(axis=1)
+        df_fe["Fan_max"]  = df_fe[fan_cols].max(axis=1)
+
+    df_fe["Cooling_efficiency"] = df_fe["Cooling_Power"] / (df_fe["Power"] + 1e-6)
+    df_fe["Cooling_lag1"]       = df_fe["Cooling_Power"].shift(1)
+    df_fe["Cooling_diff"]       = df_fe["Cooling_Power"].diff()
+
+    # ===== POWER =====
+    df_fe["Power_per_CPU"]         = df_fe["Power"] / (df_fe["CPU_Load"] + 1e-6)
+    df_fe["Power_per_VM"]          = df_fe["Power"] / (df_fe["No_Of_Running_vms"] + 1)
+    df_fe["Power_per_core"]        = df_fe["Power"] / (df_fe["CPU_cores"] + 1e-6)
+    df_fe["Power_CPU_interaction"] = df_fe["Power"] * df_fe["CPU_Load"]
+    df_fe["Power_diff"]            = df_fe["Power"].diff()
+
+    # ===== NETWORK =====
+    if "Network_RX" in df_fe.columns and "Network_TX" in df_fe.columns:
+        df_fe["Network_total"] = df_fe["Network_RX"] + df_fe["Network_TX"]
+
+    # ===== ROLLING WINDOWS / THERMAL INERTIA =====
+    df_fe["Power_rolling_30min"] = df_fe["Power"].rolling(window=3).mean()
+    df_fe["CPU_rolling_30min"]   = df_fe["CPU_Load"].rolling(window=3).mean()
+
+    # ===== TEMPORAL =====
+    df_fe["Ambient_Temp_lag1"] = df_fe["Ambient_Temperature"].shift(1)
+    df_fe["Ambient_Temp_lag2"] = df_fe["Ambient_Temperature"].shift(2)
+    df_fe["CPU_Load_diff"]     = df_fe["CPU_Load"].diff()
+
+    # ===== CPU MAX TEMP =====
+    cpu_cols = [c for c in df_fe.columns if "CPU" in c and "Temp" in c]
+    if cpu_cols:
+        df_fe["CPU_Temp_Max"] = df_fe[cpu_cols].max(axis=1)
+
+    df_fe = df_fe.dropna().reset_index(drop=True)
+    return df_fe
+
+
+def load_and_preprocess(file_path):
+    df = pd.read_csv(file_path, sep=";", parse_dates=["Time"])
+    df = df.drop(columns=["Id"], errors="ignore")
+    df = df.sort_values("Time").reset_index(drop=True)
+    return df
+
+
+# ==============================
+# TRAIN-ONLY FEATURE IMPORTANCE (NO LEAKAGE)
+# ==============================
+
+print("Computing feature importance from TRAIN-only data across all files...")
+
+target = "Ambient_Temperature"
+cols_to_drop = [
+    "Id", "Series", "Time",
+    "CPU1_Temperature", "CPU2_Temperature", "CPU_Temp_Max",
+    "Inlet_Temperature", "Ambient_Temp_lag2",
+    target
+]
+
+train_parts = []
+for file_path in csv_files:
+    df = load_and_preprocess(file_path)
+    df_fe = create_features(df)
+
+    split = int(0.8 * len(df_fe))
+    df_train = df_fe.iloc[:split].copy()   # only train segment
+    train_parts.append(df_train)
+
+train_df = pd.concat(train_parts, ignore_index=True)
+
+feature_cols = [c for c in train_df.columns if c not in cols_to_drop]
+
+importance_model = XGBRegressor(
+    n_estimators=100,
+    max_depth=4,
+    learning_rate=0.1,
+    random_state=42,
+    n_jobs=-1
+)
+importance_model.fit(train_df[feature_cols], train_df[target])
+
+importance = pd.Series(importance_model.feature_importances_, index=feature_cols)
+top_features = importance.nlargest(15).index.tolist()
+
+# freeze deploy-time features (fixed names + fixed order)
+deploy_features = top_features.copy()
+
+print(f"Top 15 TRAIN-only features selected: {top_features}")
+print(f"Deploy features (fixed): {deploy_features}\n")
+# ==============================
+# MAIN LOOP PER FILE
+# ==============================
+
+for file_path in csv_files:
+    print(f"\nProcessing: {os.path.basename(file_path)}")
+
+    df    = load_and_preprocess(file_path)
+    df_fe = create_features(df)
+
+    # Ensure fixed deploy feature schema exists in every file
+    missing = [f for f in deploy_features if f not in df_fe.columns]
+    if missing:
+        for m in missing:
+            df_fe[m] = 0.0
+
+    y = df_fe[target].clip(lower=15.0, upper=110.0)   # optional robust clipping
+    X = df_fe[deploy_features]                         # FIXED features/order
+
+    split = int(0.8 * len(df_fe))
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    scaler         = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled  = scaler.transform(X_test)
+
+    # ── Train base models on full training split ──
+    rf  = RandomForestRegressor(**RF_PARAMS).fit(X_train, y_train)
+    xgb = XGBRegressor(**XGB_PARAMS).fit(X_train, y_train)
+    svr = SVR(kernel="rbf", C=10, gamma="scale", epsilon=0.01).fit(X_train_scaled, y_train)
+    knn = KNeighborsRegressor(n_neighbors=5, n_jobs=-1).fit(X_train_scaled, y_train)
+    en  = ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=2000).fit(X_train_scaled, y_train)
+
+    # ── Test predictions ──
+    rf_test_pred  = rf.predict(X_test)
+    xgb_test_pred = xgb.predict(X_test)
+    svr_test_pred = svr.predict(X_test_scaled)
+    knn_test_pred = knn.predict(X_test_scaled)
+    en_test_pred  = en.predict(X_test_scaled)
+
+    # ── OOF predictions on the training split (time-aware) ──
+    tscv = TimeSeriesSplit(n_splits=5)
+    oof = {k: np.zeros(len(X_train), dtype=float) for k in ["rf", "svr", "knn", "xgb", "en"]}
+
+    # Track which rows actually got OOF predictions
+    filled_mask = np.zeros(len(X_train), dtype=bool)
+
+    for tr_idx, val_idx in tscv.split(X_train):
+        Xf,  Xv  = X_train.iloc[tr_idx],   X_train.iloc[val_idx]
+        yf       = y_train.iloc[tr_idx]
+        Xfs, Xvs = X_train_scaled[tr_idx], X_train_scaled[val_idx]
+
+        oof["rf"][val_idx]  = RandomForestRegressor(**RF_PARAMS).fit(Xf, yf).predict(Xv)
+        oof["xgb"][val_idx] = XGBRegressor(**XGB_PARAMS).fit(Xf, yf).predict(Xv)
+        oof["svr"][val_idx] = SVR(kernel="rbf", C=10, gamma="scale", epsilon=0.01).fit(Xfs, yf).predict(Xvs)
+        oof["knn"][val_idx] = KNeighborsRegressor(n_neighbors=5, n_jobs=-1).fit(Xfs, yf).predict(Xvs)
+        oof["en"][val_idx]  = ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=2000).fit(Xfs, yf).predict(Xvs)
+
+        filled_mask[val_idx] = True
+
+    # ── Per-file meta-model: use ONLY rows with valid OOF predictions ──
+    meta_X_train_full = np.column_stack([oof["rf"], oof["xgb"], oof["en"]])
+    meta_y_train_full = y_train.values
+
+    meta_X_train = meta_X_train_full[filled_mask]
+    meta_y_train = meta_y_train_full[filled_mask]
+    meta_X_test  = np.column_stack([rf_test_pred, xgb_test_pred, en_test_pred])
+
+    meta_scaler = StandardScaler()
+    meta_X_train_s = meta_scaler.fit_transform(meta_X_train)
+    meta_X_test_s  = meta_scaler.transform(meta_X_test)
+
+    per_file_meta = RidgeCV(alphas=np.logspace(-4, 4, 40))
+    per_file_meta.fit(meta_X_train_s, meta_y_train)
+    meta_preds = per_file_meta.predict(meta_X_test_s)
+
+    # ── Accumulate OOF preds for the global final meta-model (ONLY valid OOF rows) ──
+    for k in ["rf", "xgb", "en"]:
+        global_oof_preds[k].append(oof[k][filled_mask])
+    global_oof_labels.append(y_train.values[filled_mask])
+
+    # ── Store predictions ──
+    all_preds["rf"].append(rf_test_pred)
+    all_preds["svr"].append(svr_test_pred)
+    all_preds["knn"].append(knn_test_pred)
+    all_preds["xgb"].append(xgb_test_pred)
+    all_preds["en"].append(en_test_pred)
+    all_preds["stack"].append(meta_preds)
+    all_preds["y_true"].append(y_test.values)
+
+    # ── Metrics ──
+    for key, pred in [("rf",    rf_test_pred),
+                      ("svr",   svr_test_pred),
+                      ("knn",   knn_test_pred),
+                      ("xgb",   xgb_test_pred),
+                      ("en",    en_test_pred),
+                      ("stack", meta_preds)]:
+        results_rmse[key].append(np.sqrt(mean_squared_error(y_test, pred)))
+        results_mae[key].append(mean_absolute_error(y_test, pred))
+        results_r2[key].append(r2_score(y_test, pred))
+        all_errors[key].append(y_test.values - pred)
+
+    if results_rmse["stack"][-1] < 0.1:
+        low_rmse_files.append(os.path.basename(file_path))
+
+    print(
+        f"  {'':6s} {'RF':>8} {'SVR':>8} {'KNN':>8} {'XGB':>8} {'EN':>8} {'STACK':>8}\n"
+        f"  {'RMSE':<6} " + "  ".join(f"{results_rmse[k][-1]:>6.3f}" for k in ["rf","svr","knn","xgb","en","stack"]) + "\n"
+        f"  {'MAE':<6} "  + "  ".join(f"{results_mae[k][-1]:>6.3f}"  for k in ["rf","svr","knn","xgb","en","stack"]) + "\n"
+        f"  {'R²':<6} "   + "  ".join(f"{results_r2[k][-1]:>6.4f}"   for k in ["rf","svr","knn","xgb","en","stack"])
+    )
+
+
+# ==========================================
+# FINAL META-MODEL — fit on global OOF only
+# ==========================================
+
+global_oof_matrix = np.column_stack([
+    np.concatenate(global_oof_preds["rf"]),
+    np.concatenate(global_oof_preds["xgb"]),
+    np.concatenate(global_oof_preds["en"])
+])
+global_oof_y = np.concatenate(global_oof_labels)
+
+global_meta_scaler = StandardScaler()
+global_oof_matrix_s = global_meta_scaler.fit_transform(global_oof_matrix)
+
+meta_model_final = RidgeCV(alphas=np.logspace(-4, 4, 40))
+meta_model_final.fit(global_oof_matrix_s, global_oof_y)
+
+print("\n===== FINAL META-MODEL RIDGE WEIGHTS (RF, XGB, EN) =====")
+for name, coef in zip(["RF", "XGB", "EN"], meta_model_final.coef_):
+    print(f"  {name:<6}: {coef:>8.4f}")
+print(f"  {'Intercept':<6}: {meta_model_final.intercept_:>8.4f}")
+
+# Evaluate the final meta-model on pooled test predictions
+pooled_test_matrix = np.column_stack([
+    np.concatenate(all_preds["rf"]),
+    np.concatenate(all_preds["xgb"]),
+    np.concatenate(all_preds["en"])
+])
+pooled_test_matrix_s = global_meta_scaler.transform(pooled_test_matrix)
+
+pooled_y_true    = np.concatenate(all_preds["y_true"])
+final_meta_preds = meta_model_final.predict(pooled_test_matrix_s)
+
+final_rmse = np.sqrt(mean_squared_error(pooled_y_true, final_meta_preds))
+final_mae  = mean_absolute_error(pooled_y_true, final_meta_preds)
+final_r2   = r2_score(pooled_y_true, final_meta_preds)
+
+print(f"\n===== FINAL META-MODEL — Pooled Test Evaluation =====")
+print(f"  RMSE: {final_rmse:.4f} | MAE: {final_mae:.4f} | R²: {final_r2:.4f}")... study and understand this code properly.

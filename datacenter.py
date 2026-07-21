@@ -21,6 +21,8 @@ class VM:
             
         # Utilization represents how hard the VM is working (0.0 to 1.0)
         self.cpu_utilization = 0.0
+        self.active_ticks = 0
+        self.overload_ticks = 0
 
     @property
     def used_cores(self):
@@ -41,8 +43,13 @@ class Host:
         self.idle_power = 142.0 
         self.max_power = 380.0
         
+        self.active_ticks = 0
+        self.overload_ticks = 0
         self.hosted_vms = []
         self.is_active = False 
+        
+        # --- NEW CODE: Allow dynamic limits set by the simulator ---
+        self.cpu_limit = 0.90
 
     @property
     def current_cpu_utilization(self):
@@ -64,12 +71,11 @@ class Host:
         return self.idle_power + (self.current_cpu_utilization * (self.max_power - self.idle_power))
 
     def can_accept(self, vm):
-        # THE FIX: Limit by ACTUAL CPU Utilization (used_cores), not Provisioned capacity
+        # THE FIX: Limit by the algorithm's specific CPU limit
         projected_used_cores = sum(v.used_cores for v in self.hosted_vms) + vm.used_cores
         projected_ram = sum(v.ram for v in self.hosted_vms) + vm.ram
         
-        # Max 90% Utilization Cap (Matching the IEEE paper exactly)
-        if (projected_used_cores / self.max_cores) > 0.90:
+        if (projected_used_cores / self.max_cores) > self.cpu_limit:
             return False
             
         # RAM is a hard physical limit, so we keep provisioned RAM
@@ -77,7 +83,6 @@ class Host:
             return False
             
         return True
-
     def add_vm(self, vm):
         if self.can_accept(vm):
             self.hosted_vms.append(vm)
@@ -92,7 +97,13 @@ class Host:
         state = "ON " if self.is_active else "OFF"
         cpu_pct = self.current_cpu_utilization * 100
         return f"Host({self.host_id} | {state} | VMs: {len(self.hosted_vms):2} | CPU: {cpu_pct:4.1f}% | Power: {self.current_power:6.1f}W)"
-
+    def tick(self):
+        """Called every simulation step to track SLA metrics."""
+        if self.is_active:
+            self.active_ticks += 1
+            # If CPU utilization hits 100% (1.0), it's an SLA violation for this tick
+            if self.current_cpu_utilization >= 1.0:
+                self.overload_ticks += 1
 class WorkloadStreamer:
     """Reads real data and converts CPU load into incoming VMs."""
     def __init__(self, csv_path):
